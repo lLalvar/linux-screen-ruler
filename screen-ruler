@@ -1,0 +1,798 @@
+#!/usr/bin/python3
+"""
+screen-ruler — a PowerToys Screen Ruler port for Ubuntu (GNOME, X11 and Wayland).
+
+How it works (mirrors microsoft/PowerToys src/modules/MeasureTool):
+  1. Take one snapshot of the desktop (PowerToys' default "non-continuous" mode).
+  2. Show a borderless fullscreen overlay on every monitor, painted with that snapshot.
+  3. On every pointer move, walk left/right/up/down from the pointer pixel until a
+     pixel differs from the start pixel by more than the tolerance (EdgeDetection.cpp).
+  4. Draw the measured lines/box and a label; click copies the size to the clipboard.
+
+Modes: 1 Bounds  2 Spacing (cross)  3 Horizontal  4 Vertical   (Ctrl+1..4 also work)
+Mouse:  click = copy & close · Shift+click = pin & keep going · wheel = tolerance ±15
+Keys:   Esc / right click = close · +/- = tolerance · U = cycle extra unit
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+from dataclasses import dataclass, field
+
+import gi
+
+gi.require_version("Gtk", "3.0")
+gi.require_version("Gdk", "3.0")
+gi.require_version("GdkPixbuf", "2.0")
+gi.require_version("Pango", "1.0")
+gi.require_version("PangoCairo", "1.0")
+from gi.repository import Gdk, GdkPixbuf, Gio, GLib, Gtk, Pango, PangoCairo  # noqa: E402
+
+import cairo  # noqa: E402
+import numpy as np  # noqa: E402
+
+VERSION = "1.0.0"
+APP_ID = "io.github.screenruler"
+
+# --------------------------------------------------------------------------- settings
+# Defaults are taken from PowerToys MeasureToolCore/Settings.h and constants.h.
+DEFAULTS = {
+    "pixel_tolerance": 30,          # Settings.h: pixelTolerance = 30
+    "per_channel_edge_detection": False,
+    "draw_feet_on_cross": True,
+    "line_color": "#FF4500",        # Settings.h: {255, 69, 0} (OrangeRed)
+    "extra_unit": "none",           # none | in | cm | mm | dip
+    "default_mode": "spacing",      # bounds | spacing | horizontal | vertical
+    "wheel_step": 15,               # constants.h: MOUSE_WHEEL_TOLERANCE_STEP
+    "capture_backend": "auto",      # auto | x11 | gnome-screenshot | portal | grim
+}
+CONFIG_PATH = os.path.join(
+    os.environ.get("XDG_CONFIG_HOME", os.path.expanduser("~/.config")), "screen-ruler", "config.json"
+)
+MODES = ["bounds", "spacing", "horizontal", "vertical"]
+UNITS = ["none", "in", "cm", "mm", "dip"]
+UNIT_ABBR = {"px": "px", "in": "in", "cm": "cm", "mm": "mm", "dip": "dip"}
+
+
+def load_settings() -> dict:
+    s = dict(DEFAULTS)
+    try:
+        with open(CONFIG_PATH, encoding="utf-8") as f:
+            user = json.load(f)
+        s.update({k: v for k, v in user.items() if k in DEFAULTS})
+    except FileNotFoundError:
+        pass
+    except Exception as e:  # bad JSON shouldn't stop the tool
+        print(f"screen-ruler: ignoring config ({e})", file=sys.stderr)
+    s["pixel_tolerance"] = int(max(0, min(255, s["pixel_tolerance"])))
+    if s["default_mode"] not in MODES:
+        s["default_mode"] = "spacing"
+    if s["extra_unit"] not in UNITS:
+        s["extra_unit"] = "none"
+    return s
+
+
+def parse_color(hex_color: str) -> tuple[float, float, float]:
+    rgba = Gdk.RGBA()
+    if not rgba.parse(hex_color):
+        rgba.parse(DEFAULTS["line_color"])
+    return rgba.red, rgba.green, rgba.blue
+
+
+# --------------------------------------------------------------------------- edge detection
+def find_edges(img: np.ndarray, x: int, y: int, tolerance: int, per_channel: bool) -> tuple[int, int, int, int]:
+    """Port of PowerToys EdgeDetection.cpp::DetectEdges.
+
+    img: H x W x 3 int16 array. Returns inclusive (left, top, right, bottom): the
+    coordinate of the last pixel in each direction that is still "close" to the
+    pixel under the cursor. A 5x5 square at (20,100) gives (20, 100, 24, 104).
+
+    Closeness (BGRATextureView::PixelsClose):
+      per_channel  -> every channel |a-b| <= tolerance
+      otherwise    -> sum of channel |a-b| <= tolerance
+    """
+    h, w = img.shape[:2]
+    # PowerToys clamps the start point to [1, size-2].
+    x = int(min(max(x, 1), w - 2))
+    y = int(min(max(y, 1), h - 2))
+    start = img[y, x]
+
+    def similar_run(line: np.ndarray) -> int:
+        """Number of consecutive pixels in `line` close to `start`."""
+        if line.shape[0] == 0:
+            return 0
+        diff = np.abs(line - start)
+        far = (diff > tolerance).any(axis=1) if per_channel else diff.sum(axis=1) > tolerance
+        hit = int(np.argmax(far))
+        return hit if far[hit] else line.shape[0]
+
+    left = x - similar_run(img[y, x - 1::-1])
+    right = x + similar_run(img[y, x + 1:])
+    top = y - similar_run(img[y - 1::-1, x])
+    bottom = y + similar_run(img[y + 1:, x])
+    return left, top, right, bottom
+
+
+# --------------------------------------------------------------------------- units
+def convert(pixels: float, unit: str, px2mm: float, scale: float) -> float:
+    """Port of MeasurementLogic.h::Convert. 'dip' maps to GNOME logical pixels."""
+    if unit == "px":
+        return pixels
+    if unit == "dip":
+        return pixels / scale if scale > 0 else pixels
+    if px2mm > 0:
+        mm = pixels * px2mm
+    else:  # no EDID size -> assume 96 DPI, like PowerToys' fallback
+        mm = pixels / 96.0 * 25.4
+    return {"in": mm / 25.4, "cm": mm / 10.0, "mm": mm}.get(unit, pixels)
+
+
+def fmt(v: float) -> str:
+    return f"{v:.4g}"  # PowerToys prints with %.4g
+
+
+# --------------------------------------------------------------------------- capture
+def _session_type() -> str:
+    if os.environ.get("WAYLAND_DISPLAY") or os.environ.get("XDG_SESSION_TYPE") == "wayland":
+        return "wayland"
+    return "x11"
+
+
+def _capture_x11() -> GdkPixbuf.Pixbuf:
+    root = Gdk.get_default_root_window()
+    pb = Gdk.pixbuf_get_from_window(root, 0, 0, root.get_width(), root.get_height())
+    if pb is None:
+        raise RuntimeError("X11 root window capture failed")
+    return pb
+
+
+def _capture_gnome_screenshot() -> GdkPixbuf.Pixbuf:
+    # gnome-screenshot is on GNOME Shell's allow-list for org.gnome.Shell.Screenshot,
+    # so it captures silently on Wayland (no permission dialog).
+    if not shutil.which("gnome-screenshot"):
+        raise RuntimeError("gnome-screenshot not installed")
+    fd, path = tempfile.mkstemp(prefix="screen-ruler-", suffix=".png")
+    os.close(fd)
+    try:
+        subprocess.run(["gnome-screenshot", "-f", path], check=True, timeout=10,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return GdkPixbuf.Pixbuf.new_from_file(path)
+    finally:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+
+
+def _capture_grim() -> GdkPixbuf.Pixbuf:
+    # wlroots compositors (Sway, Hyprland) – not GNOME.
+    if not shutil.which("grim"):
+        raise RuntimeError("grim not installed")
+    fd, path = tempfile.mkstemp(prefix="screen-ruler-", suffix=".png")
+    os.close(fd)
+    try:
+        subprocess.run(["grim", path], check=True, timeout=10)
+        return GdkPixbuf.Pixbuf.new_from_file(path)
+    finally:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+
+
+def _capture_portal() -> GdkPixbuf.Pixbuf:
+    """org.freedesktop.portal.Screenshot, non-interactive. GNOME may ask permission once."""
+    bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+    sender = bus.get_unique_name()[1:].replace(".", "_")
+    token = f"screenruler{os.getpid()}{int(time.time() * 1000) % 100000}"
+    req_path = f"/org/freedesktop/portal/desktop/request/{sender}/{token}"
+    loop = GLib.MainLoop()
+    result: dict = {}
+
+    def on_response(_conn, _sender, _path, _iface, _signal, params, _data):
+        code, res = params.unpack()
+        result["code"] = code
+        result["uri"] = res.get("uri")
+        loop.quit()
+
+    sub = bus.signal_subscribe("org.freedesktop.portal.Desktop", "org.freedesktop.portal.Request",
+                               "Response", req_path, None, Gio.DBusSignalFlags.NO_MATCH_RULE,
+                               on_response, None)
+    try:
+        opts = {"handle_token": GLib.Variant("s", token), "interactive": GLib.Variant("b", False)}
+        bus.call_sync("org.freedesktop.portal.Desktop", "/org/freedesktop/portal/desktop",
+                      "org.freedesktop.portal.Screenshot", "Screenshot",
+                      GLib.Variant("(sa{sv})", ("", opts)), GLib.VariantType("(o)"),
+                      Gio.DBusCallFlags.NONE, -1, None)
+        GLib.timeout_add_seconds(60, loop.quit)
+        loop.run()
+    finally:
+        bus.signal_unsubscribe(sub)
+    if result.get("code") != 0 or not result.get("uri"):
+        raise RuntimeError("screenshot portal request was denied or cancelled")
+    gfile = Gio.File.new_for_uri(result["uri"])
+    pb = GdkPixbuf.Pixbuf.new_from_file(gfile.get_path())
+    try:  # the portal saves a file we asked for; don't leave it in ~/Pictures
+        gfile.delete(None)
+    except GLib.Error:
+        pass
+    return pb
+
+
+def capture_desktop(backend: str) -> GdkPixbuf.Pixbuf:
+    order = {
+        "x11": [_capture_x11],
+        "gnome-screenshot": [_capture_gnome_screenshot],
+        "portal": [_capture_portal],
+        "grim": [_capture_grim],
+    }.get(backend)
+    if order is None:  # auto
+        if _session_type() == "x11":
+            order = [_capture_x11, _capture_gnome_screenshot, _capture_portal]
+        else:
+            order = [_capture_gnome_screenshot, _capture_portal, _capture_grim]
+    errors = []
+    for fn in order:
+        try:
+            return fn()
+        except Exception as e:
+            errors.append(f"{fn.__name__[9:]}: {e}")
+    raise RuntimeError("could not capture the screen:\n  " + "\n  ".join(errors))
+
+
+def pixbuf_to_array(pb: GdkPixbuf.Pixbuf) -> np.ndarray:
+    w, h, n, stride = pb.get_width(), pb.get_height(), pb.get_n_channels(), pb.get_rowstride()
+    data = pb.read_pixel_bytes().get_data()
+    arr = np.ndarray(shape=(h, w, n), dtype=np.uint8, buffer=data, strides=(stride, n, 1))
+    return arr[:, :, :3].astype(np.int16)
+
+
+# --------------------------------------------------------------------------- model
+@dataclass
+class Frame:
+    """The part of the snapshot under one monitor."""
+    pixbuf: GdkPixbuf.Pixbuf
+    pixels: np.ndarray
+    sx: float  # image px per logical px
+    sy: float
+    px2mm: float
+
+
+@dataclass
+class Measurement:
+    mode: str
+    rect: tuple[float, float, float, float]  # image px; inclusive l,t,r,b (spacing) or drag box
+    cursor: tuple[float, float] = (0.0, 0.0)  # logical px, for the label
+
+    def width_px(self) -> float:
+        return self.rect[2] - self.rect[0] + 1
+
+    def height_px(self) -> float:
+        return self.rect[3] - self.rect[1] + 1
+
+    def shows(self) -> tuple[bool, bool]:
+        return {"horizontal": (True, False), "vertical": (False, True)}.get(self.mode, (True, True))
+
+    def text(self, unit: str, px2mm: float, scale: float, with_abbr: bool = True) -> str:
+        sw, sh = self.shows()
+        parts = []
+        if sw:
+            parts.append(fmt(convert(self.width_px(), unit, px2mm, scale)))
+        if sh:
+            parts.append(fmt(convert(self.height_px(), unit, px2mm, scale)))
+        s = " × ".join(parts)
+        return f"{s} {UNIT_ABBR[unit]}" if with_abbr else s
+
+
+@dataclass
+class Shared:
+    settings: dict
+    mode: str
+    tolerance: int
+    extra_unit: str
+    windows: list = field(default_factory=list)
+    hud_until: float = 0.0
+    hud_text: str = ""
+    finished: bool = False
+
+
+# --------------------------------------------------------------------------- overlay
+TOOLBAR_BTN = 40
+TOOLBAR_PAD = 6
+TOOLBAR_TOP = 16
+TOOLBAR_ITEMS = MODES + ["close"]
+
+
+class Overlay(Gtk.Window):
+    def __init__(self, app: "ScreenRuler", shared: Shared, monitor: Gdk.Monitor, index: int, frame: Frame):
+        super().__init__(type=Gtk.WindowType.TOPLEVEL)
+        self.app, self.shared, self.monitor, self.frame = app, shared, monitor, frame
+        geo = monitor.get_geometry()
+        self.width, self.height = geo.width, geo.height
+        self.color = parse_color(shared.settings["line_color"])
+
+        self.cursor: tuple[float, float] | None = None
+        self.current: Measurement | None = None
+        self.pinned: list[Measurement] = []
+        self.drag_start: tuple[float, float] | None = None
+
+        self.set_title("Screen Ruler")
+        self.set_decorated(False)
+        self.set_skip_taskbar_hint(True)
+        self.set_skip_pager_hint(True)
+        self.set_keep_above(True)
+        self.set_app_paintable(True)
+        self.set_default_size(geo.width, geo.height)
+        self.move(geo.x, geo.y)
+
+        self.surface = Gdk.cairo_surface_create_from_pixbuf(frame.pixbuf, 1, None)
+
+        area = Gtk.DrawingArea()
+        area.set_can_focus(True)
+        area.add_events(Gdk.EventMask.POINTER_MOTION_MASK | Gdk.EventMask.BUTTON_PRESS_MASK
+                        | Gdk.EventMask.BUTTON_RELEASE_MASK | Gdk.EventMask.SCROLL_MASK
+                        | Gdk.EventMask.SMOOTH_SCROLL_MASK | Gdk.EventMask.LEAVE_NOTIFY_MASK
+                        | Gdk.EventMask.KEY_PRESS_MASK)
+        area.connect("draw", self.on_draw)
+        area.connect("motion-notify-event", self.on_motion)
+        area.connect("button-press-event", self.on_press)
+        area.connect("button-release-event", self.on_release)
+        area.connect("scroll-event", self.on_scroll)
+        area.connect("leave-notify-event", self.on_leave)
+        self.connect("key-press-event", self.on_key)
+        self.connect("realize", self.on_realize)
+        self.add(area)
+        self.area = area
+
+        self.fullscreen_on_monitor(self.get_screen(), index)
+
+    # -- helpers
+    def on_realize(self, _w):
+        cursor = Gdk.Cursor.new_from_name(self.get_display(), "crosshair")
+        if cursor:
+            self.get_window().set_cursor(cursor)
+
+    def to_image(self, x: float, y: float) -> tuple[int, int]:
+        h, w = self.frame.pixels.shape[:2]
+        return (min(max(int(x * self.frame.sx), 0), w - 1), min(max(int(y * self.frame.sy), 0), h - 1))
+
+    def toolbar_rect(self) -> tuple[float, float, float, float]:
+        w = len(TOOLBAR_ITEMS) * TOOLBAR_BTN + 2 * TOOLBAR_PAD
+        h = TOOLBAR_BTN + 2 * TOOLBAR_PAD
+        return (self.width - w) / 2, TOOLBAR_TOP, w, h
+
+    def toolbar_hit(self, x: float, y: float) -> str | None:
+        tx, ty, tw, th = self.toolbar_rect()
+        if not (tx <= x <= tx + tw and ty <= y <= ty + th):
+            return None
+        i = int((x - tx - TOOLBAR_PAD) // TOOLBAR_BTN)
+        return TOOLBAR_ITEMS[min(max(i, 0), len(TOOLBAR_ITEMS) - 1)]
+
+    def measure_at(self, x: float, y: float) -> Measurement:
+        ix, iy = self.to_image(x, y)
+        s = self.shared
+        rect = find_edges(self.frame.pixels, ix, iy, s.tolerance, s.settings["per_channel_edge_detection"])
+        return Measurement(s.mode, rect, (x, y))
+
+    def refresh(self):
+        if self.cursor and self.shared.mode != "bounds" and not self.toolbar_hit(*self.cursor):
+            self.current = self.measure_at(*self.cursor)
+        elif self.shared.mode != "bounds":
+            self.current = None
+        self.area.queue_draw()
+
+    def label_text(self, m: Measurement) -> str:
+        scale = self.frame.sx
+        txt = m.text("px", self.frame.px2mm, scale)
+        if self.shared.extra_unit != "none":
+            sep = "\n" if all(m.shows()) else " "
+            txt += f"{sep}({m.text(self.shared.extra_unit, self.frame.px2mm, scale)})"
+        return txt
+
+    # -- events
+    def on_motion(self, _w, ev):
+        self.cursor = (ev.x, ev.y)
+        if self.shared.mode == "bounds" and self.drag_start:
+            self.current = self.bounds_measurement(ev.x, ev.y)
+            self.area.queue_draw()
+        else:
+            self.refresh()
+        return True
+
+    def on_leave(self, _w, _ev):
+        if not self.drag_start:
+            self.cursor = None
+            self.current = None
+            self.area.queue_draw()
+        return False
+
+    def bounds_measurement(self, x: float, y: float) -> Measurement:
+        (x0, y0), sx, sy = self.drag_start, self.frame.sx, self.frame.sy
+        l, r = sorted((x0 * sx, x * sx))
+        t, b = sorted((y0 * sy, y * sy))
+        # inclusive pixels covered by the drag, so a click without movement is 1 x 1
+        return Measurement("bounds", (round(l), round(t), round(r), round(b)), (x, y))
+
+    def on_press(self, _w, ev):
+        if ev.button == 3:
+            self.app.finish(copy=False)
+            return True
+        if ev.button != 1:
+            return False
+        hit = self.toolbar_hit(ev.x, ev.y)
+        if hit == "close":
+            self.app.finish(copy=False)
+        elif hit:
+            self.app.set_mode(hit)
+        elif self.shared.mode == "bounds":
+            self.drag_start = (ev.x, ev.y)
+            self.current = self.bounds_measurement(ev.x, ev.y)
+            self.area.queue_draw()
+        return True
+
+    def on_release(self, _w, ev):
+        if ev.button != 1 or self.toolbar_hit(ev.x, ev.y) and not self.drag_start:
+            return False
+        shift = bool(ev.state & Gdk.ModifierType.SHIFT_MASK)
+        if self.shared.mode == "bounds":
+            if not self.drag_start:
+                return True
+            m = self.bounds_measurement(ev.x, ev.y)
+            self.drag_start = None
+            self.current = None
+            if shift:  # BoundsToolOverlayUI: Shift keeps the box
+                self.pinned.append(m)
+                self.app.copy([m])
+                self.area.queue_draw()
+            else:
+                self.app.finish(copy=True, extra=[m])
+            return True
+        # spacing modes – MeasureToolOverlayUI::HandleCursorUp
+        if self.current is None:
+            return True
+        if shift:
+            self.pinned.append(self.current)
+            self.app.copy(self.app.all_pinned())
+            self.area.queue_draw()
+        else:
+            self.app.finish(copy=True, extra=[self.current])
+        return True
+
+    def on_scroll(self, _w, ev):
+        step = self.shared.settings["wheel_step"]
+        if ev.direction == Gdk.ScrollDirection.UP:
+            self.app.change_tolerance(step)
+        elif ev.direction == Gdk.ScrollDirection.DOWN:
+            self.app.change_tolerance(-step)
+        elif ev.direction == Gdk.ScrollDirection.SMOOTH:
+            ok, _dx, dy = ev.get_scroll_deltas()
+            if ok and dy:
+                self.app.change_tolerance(-step if dy > 0 else step)
+        return True
+
+    def on_key(self, _w, ev):
+        key = Gdk.keyval_name(ev.keyval) or ""
+        if key == "Escape":
+            # PowerToys copies pinned boxes on Esc in bounds mode; spacing just closes.
+            self.app.finish(copy=self.shared.mode == "bounds" and bool(self.app.all_pinned()))
+        elif key in ("1", "2", "3", "4", "KP_1", "KP_2", "KP_3", "KP_4"):
+            self.app.set_mode(MODES[int(key[-1]) - 1])
+        elif key in ("plus", "equal", "KP_Add"):
+            self.app.change_tolerance(self.shared.settings["wheel_step"])
+        elif key in ("minus", "KP_Subtract"):
+            self.app.change_tolerance(-self.shared.settings["wheel_step"])
+        elif key in ("u", "U"):
+            self.app.cycle_unit()
+        else:
+            return False
+        return True
+
+    # -- drawing
+    def on_draw(self, _w, cr: cairo.Context):
+        cr.save()
+        cr.scale(1 / self.frame.sx, 1 / self.frame.sy)
+        cr.set_source_surface(self.surface, 0, 0)
+        cr.get_source().set_filter(cairo.FILTER_NEAREST)
+        cr.paint()
+        cr.restore()
+
+        for m in self.pinned:
+            self.draw_measurement(cr, m, faint=False)
+        if self.current is not None:
+            self.draw_measurement(cr, self.current, faint=True)
+        self.draw_toolbar(cr)
+        return True
+
+    def lx(self, px: float) -> float:
+        return px / self.frame.sx
+
+    def ly(self, px: float) -> float:
+        return px / self.frame.sy
+
+    def draw_measurement(self, cr, m: Measurement, faint: bool):
+        r, g, b = self.color
+        cr.set_line_width(1)
+        if m.mode == "bounds":
+            x0, y0 = self.lx(m.rect[0]), self.ly(m.rect[1])
+            x1, y1 = self.lx(m.rect[2] + 1), self.ly(m.rect[3] + 1)
+            cr.rectangle(x0, y0, x1 - x0, y1 - y0)
+            cr.set_source_rgba(r, g, b, 0.15)
+            cr.fill_preserve()
+            cr.set_source_rgb(r, g, b)
+            cr.set_dash([4, 3])
+            cr.stroke()
+            cr.set_dash([])
+            self.draw_label(cr, self.label_text(m), m.cursor)
+            return
+
+        cx, cy = m.cursor
+        # centre of the logical pixel under the cursor, so 1px lines stay crisp
+        lineX, lineY = int(cx) + 0.5, int(cy) + 0.5
+        show_w, show_h = m.shows()
+        left, top = self.lx(m.rect[0]), self.ly(m.rect[1])
+        right, bottom = self.lx(m.rect[2] + 1), self.ly(m.rect[3] + 1)
+        feet = 3.0 if self.shared.settings["draw_feet_on_cross"] else 0.0
+
+        if faint:  # constants.h CROSS_OPACITY: faint guide across the whole screen
+            cr.set_source_rgba(r, g, b, 0.25)
+            if show_w:
+                cr.move_to(0, lineY); cr.line_to(self.width, lineY)
+            if show_h:
+                cr.move_to(lineX, 0); cr.line_to(lineX, self.height)
+            cr.stroke()
+
+        cr.set_source_rgb(r, g, b)
+        if show_w:
+            cr.move_to(left, lineY); cr.line_to(right, lineY)
+            if feet:
+                cr.move_to(left + 0.5, lineY - feet); cr.line_to(left + 0.5, lineY + feet)
+                cr.move_to(right - 0.5, lineY - feet); cr.line_to(right - 0.5, lineY + feet)
+        if show_h:
+            cr.move_to(lineX, top); cr.line_to(lineX, bottom)
+            if feet:
+                cr.move_to(lineX - feet, top + 0.5); cr.line_to(lineX + feet, top + 0.5)
+                cr.move_to(lineX - feet, bottom - 0.5); cr.line_to(lineX + feet, bottom - 0.5)
+        cr.stroke()
+        self.draw_label(cr, self.label_text(m), m.cursor)
+
+    def make_layout(self, cr, text: str, bold=False):
+        layout = PangoCairo.create_layout(cr)
+        desc = Pango.FontDescription.from_string(("Sans Bold " if bold else "Sans ") + "10.5")
+        layout.set_font_description(desc)
+        layout.set_alignment(Pango.Alignment.CENTER)
+        layout.set_text(text, -1)
+        return layout
+
+    def draw_label(self, cr, text: str, at: tuple[float, float]):
+        layout = self.make_layout(cr, text)
+        _ink, logical = layout.get_pixel_extents()
+        pad_x, pad_y, gap = 8, 5, 16
+        bw, bh = logical.width + 2 * pad_x, logical.height + 2 * pad_y
+        x, y = at
+        # like PowerToys' cursorInLeftScreenHalf/TopScreenHalf: flip toward the open side
+        bx = x + gap if x < self.width / 2 else x - gap - bw
+        by = y + gap if y < self.height / 2 else y - gap - bh
+        bx = min(max(bx, 2), self.width - bw - 2)
+        by = min(max(by, 2), self.height - bh - 2)
+        self.rounded(cr, bx + 2, by + 3, bw, bh, 5)  # shadow
+        cr.set_source_rgba(0, 0, 0, 0.35)
+        cr.fill()
+        self.rounded(cr, bx, by, bw, bh, 5)
+        cr.set_source_rgba(0.13, 0.13, 0.14, 0.94)
+        cr.fill()
+        cr.set_source_rgb(1, 1, 1)
+        cr.move_to(bx + pad_x - logical.x, by + pad_y - logical.y)
+        PangoCairo.show_layout(cr, layout)
+
+    @staticmethod
+    def rounded(cr, x, y, w, h, r):
+        cr.new_sub_path()
+        cr.arc(x + w - r, y + r, r, -1.5708, 0)
+        cr.arc(x + w - r, y + h - r, r, 0, 1.5708)
+        cr.arc(x + r, y + h - r, r, 1.5708, 3.14159)
+        cr.arc(x + r, y + r, r, 3.14159, 4.71239)
+        cr.close_path()
+
+    def draw_toolbar(self, cr):
+        tx, ty, tw, th = self.toolbar_rect()
+        r, g, b = self.color
+        self.rounded(cr, tx, ty + 2, tw, th, 8)
+        cr.set_source_rgba(0, 0, 0, 0.3)
+        cr.fill()
+        self.rounded(cr, tx, ty, tw, th, 8)
+        cr.set_source_rgba(0.13, 0.13, 0.14, 0.95)
+        cr.fill()
+        hover = self.toolbar_hit(*self.cursor) if self.cursor else None
+        for i, item in enumerate(TOOLBAR_ITEMS):
+            x = tx + TOOLBAR_PAD + i * TOOLBAR_BTN
+            y = ty + TOOLBAR_PAD
+            active = item == self.shared.mode
+            if active or item == hover:
+                self.rounded(cr, x + 3, y + 3, TOOLBAR_BTN - 6, TOOLBAR_BTN - 6, 5)
+                cr.set_source_rgba(r, g, b, 0.9) if active else cr.set_source_rgba(1, 1, 1, 0.12)
+                cr.fill()
+            cr.set_source_rgb(1, 1, 1)
+            cr.set_line_width(2)
+            cx, cy, s = x + TOOLBAR_BTN / 2, y + TOOLBAR_BTN / 2, 8
+            if item == "bounds":
+                cr.set_dash([3, 2]); cr.rectangle(cx - s, cy - s, 2 * s, 2 * s); cr.stroke(); cr.set_dash([])
+            elif item == "spacing":
+                cr.move_to(cx - s, cy); cr.line_to(cx + s, cy); cr.move_to(cx, cy - s); cr.line_to(cx, cy + s); cr.stroke()
+            elif item == "horizontal":
+                cr.move_to(cx - s, cy); cr.line_to(cx + s, cy)
+                cr.move_to(cx - s, cy - 4); cr.line_to(cx - s, cy + 4)
+                cr.move_to(cx + s, cy - 4); cr.line_to(cx + s, cy + 4); cr.stroke()
+            elif item == "vertical":
+                cr.move_to(cx, cy - s); cr.line_to(cx, cy + s)
+                cr.move_to(cx - 4, cy - s); cr.line_to(cx + 4, cy - s)
+                cr.move_to(cx - 4, cy + s); cr.line_to(cx + 4, cy + s); cr.stroke()
+            else:
+                s = 6
+                cr.move_to(cx - s, cy - s); cr.line_to(cx + s, cy + s)
+                cr.move_to(cx + s, cy - s); cr.line_to(cx - s, cy + s); cr.stroke()
+
+        if time.monotonic() < self.shared.hud_until:
+            layout = self.make_layout(cr, self.shared.hud_text)
+            _i, lg = layout.get_pixel_extents()
+            hx = (self.width - lg.width) / 2 - 8
+            hy = ty + th + 8
+            self.rounded(cr, hx, hy, lg.width + 16, lg.height + 8, 5)
+            cr.set_source_rgba(0.13, 0.13, 0.14, 0.92)
+            cr.fill()
+            cr.set_source_rgb(1, 1, 1)
+            cr.move_to(hx + 8 - lg.x, hy + 4 - lg.y)
+            PangoCairo.show_layout(cr, layout)
+
+
+# --------------------------------------------------------------------------- app
+class ScreenRuler:
+    def __init__(self, args):
+        settings = load_settings()
+        mode = args.mode or settings["default_mode"]
+        self.shared = Shared(settings, mode, settings["pixel_tolerance"], settings["extra_unit"])
+        self.args = args
+        self.result_text: str | None = None
+
+    def build_frames(self) -> list[tuple[Gdk.Monitor, int, Frame]]:
+        display = Gdk.Display.get_default()
+        monitors = [display.get_monitor(i) for i in range(display.get_n_monitors())]
+        if self.args.image:
+            m = display.get_primary_monitor() or monitors[0]
+            idx = monitors.index(m)
+            geo, sf = m.get_geometry(), m.get_scale_factor()
+            canvas = GdkPixbuf.Pixbuf.new(GdkPixbuf.Colorspace.RGB, False, 8, geo.width * sf, geo.height * sf)
+            canvas.fill(0x202124FF)
+            img = GdkPixbuf.Pixbuf.new_from_file(self.args.image)
+            cw, ch = min(img.get_width(), canvas.get_width()), min(img.get_height(), canvas.get_height())
+            img.copy_area(0, 0, cw, ch, canvas, 0, 0)
+            return [(m, idx, self._frame(canvas, sf, sf, m))]
+
+        shot = capture_desktop(self.shared.settings["capture_backend"])
+        geos = [m.get_geometry() for m in monitors]
+        minx, miny = min(g.x for g in geos), min(g.y for g in geos)
+        maxx, maxy = max(g.x + g.width for g in geos), max(g.y + g.height for g in geos)
+        # GNOME screenshots are in physical pixels while monitor geometry is logical;
+        # derive the ratio from the image itself (handles 2x and fractional scaling).
+        sx = shot.get_width() / (maxx - minx)
+        sy = shot.get_height() / (maxy - miny)
+        frames = []
+        for i, (m, g) in enumerate(zip(monitors, geos)):
+            x0, y0 = round((g.x - minx) * sx), round((g.y - miny) * sy)
+            w = min(round(g.width * sx), shot.get_width() - x0)
+            h = min(round(g.height * sy), shot.get_height() - y0)
+            sub = shot.new_subpixbuf(x0, y0, w, h).copy()
+            frames.append((m, i, self._frame(sub, sx, sy, m)))
+        return frames
+
+    @staticmethod
+    def _frame(pb: GdkPixbuf.Pixbuf, sx: float, sy: float, m: Gdk.Monitor) -> Frame:
+        wmm = m.get_width_mm()
+        px2mm = wmm / pb.get_width() if wmm > 0 else 0.0
+        return Frame(pb, pixbuf_to_array(pb), sx, sy, px2mm)
+
+    def run(self) -> int:
+        try:
+            frames = self.build_frames()
+        except Exception as e:
+            print(f"screen-ruler: {e}", file=sys.stderr)
+            self._notify(str(e))
+            return 1
+        for m, idx, frame in frames:
+            win = Overlay(self, self.shared, m, idx, frame)
+            win.connect("delete-event", lambda *_: self.finish(copy=False) or True)
+            self.shared.windows.append(win)
+            win.show_all()
+        if self.shared.windows:
+            self.shared.windows[0].present()
+        Gtk.main()
+        if self.result_text and self.args.print:
+            print(self.result_text)
+        return 0
+
+    @staticmethod
+    def _notify(msg: str):
+        if shutil.which("notify-send"):
+            subprocess.run(["notify-send", "-a", "Screen Ruler", "Screen Ruler", msg], check=False)
+
+    # -- shared actions
+    def all_pinned(self) -> list[Measurement]:
+        return [m for w in self.shared.windows for m in w.pinned]
+
+    def set_mode(self, mode: str):
+        self.shared.mode = mode
+        for w in self.shared.windows:
+            w.drag_start = None
+            w.current = None
+            w.refresh()
+
+    def change_tolerance(self, delta: int):
+        s = self.shared
+        s.tolerance = max(0, min(255, s.tolerance + delta))
+        self.hud(f"Pixel tolerance: {s.tolerance}")
+        for w in s.windows:
+            w.refresh()
+
+    def cycle_unit(self):
+        s = self.shared
+        s.extra_unit = UNITS[(UNITS.index(s.extra_unit) + 1) % len(UNITS)]
+        self.hud("Extra unit: " + ("pixels only" if s.extra_unit == "none" else s.extra_unit))
+        for w in s.windows:
+            w.refresh()
+
+    def hud(self, text: str):
+        self.shared.hud_text = text
+        self.shared.hud_until = time.monotonic() + 1.6
+        GLib.timeout_add(1700, lambda: [w.area.queue_draw() for w in self.shared.windows] and False)
+
+    def copy(self, measurements: list[Measurement]):
+        if not measurements:
+            return
+        # Clipboard.cpp: one measurement per line, "W × H", no unit abbreviation for px
+        text = "\n".join(m.text("px", 0, 1, with_abbr=False) for m in measurements)
+        self.result_text = text
+        cmd = os.environ.get("SCREEN_RULER_COPY_CMD")
+        if cmd:
+            subprocess.run(cmd, shell=True, input=text.encode(), check=False)
+            return
+        cb = Gtk.Clipboard.get(Gdk.SELECTION_CLIPBOARD)
+        cb.set_text(text, -1)
+        cb.store()
+
+    def finish(self, copy: bool, extra: list[Measurement] | None = None):
+        if self.shared.finished:
+            return
+        self.shared.finished = True
+        if copy:
+            self.copy(self.all_pinned() + (extra or []))
+        for w in self.shared.windows:
+            w.hide()
+        # keep the process alive briefly so the clipboard manager can take ownership
+        GLib.timeout_add(250 if copy else 0, Gtk.main_quit)
+
+
+def main() -> int:
+    p = argparse.ArgumentParser(description="PowerToys-style Screen Ruler for Linux")
+    p.add_argument("--mode", choices=MODES, help="start in this mode (default from config)")
+    p.add_argument("--image", help="measure inside an image file instead of the screen")
+    p.add_argument("--print", action="store_true", help="also print the copied measurement to stdout")
+    p.add_argument("--delay", type=float, default=0.0, help="seconds to wait before capturing")
+    p.add_argument("--version", action="version", version=f"screen-ruler {VERSION}")
+    args = p.parse_args()
+    if args.delay > 0:
+        time.sleep(args.delay)
+    GLib.set_prgname(APP_ID)
+    if not Gtk.init_check(sys.argv)[0]:
+        print("screen-ruler: cannot open display", file=sys.stderr)
+        return 1
+    return ScreenRuler(args).run()
+
+
+if __name__ == "__main__":
+    sys.exit(main())
