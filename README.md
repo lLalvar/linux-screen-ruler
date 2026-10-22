@@ -1,4 +1,4 @@
-# Screen Ruler for Linux
+# Linux Screen Ruler
 
 A port of the [PowerToys Screen Ruler](https://learn.microsoft.com/windows/powertoys/screen-ruler) to Ubuntu and other GNOME desktops (X11 and Wayland).
 
@@ -18,8 +18,8 @@ Press a shortcut, point at something on screen, and the ruler snaps to the neare
 Requires Ubuntu 22.04 or newer, or another Debian-based GNOME desktop.
 
 ```bash
-git clone https://github.com/lLalvar/screen-ruler.git
-cd screen-ruler
+git clone https://github.com/lLalvar/linux-screen-ruler.git
+cd linux-screen-ruler
 ./install.sh
 ```
 
@@ -118,7 +118,7 @@ If measurements don't reach the clipboard, set a copy command, for example `SCRE
 ## Limitations
 
 - **Snapshot only.** The screen is captured once when the tool opens, which is also PowerToys' default. Live ("continuous") measuring isn't supported, because on Wayland it would need a screen-recording session and a permission prompt.
-- The Wayland capture paths have had less testing than X11. Please [open an issue](https://github.com/lLalvar/screen-ruler/issues) if capture fails on your setup.
+- The Wayland capture paths have had less testing than X11. Please [open an issue](https://github.com/lLalvar/linux-screen-ruler/issues) if capture fails on your setup.
 
 ## How it works
 
